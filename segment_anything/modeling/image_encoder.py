@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from typing import Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple, Type
 
 from .common import LayerNorm2d, MLPBlock
 
@@ -314,6 +314,29 @@ def window_unpartition(
     return x
 
 
+def get_abs_pos(pos_embed: torch.Tensor, hw: Tuple[int, int]) -> torch.Tensor:
+    """Absolute position embedding for an arbitrary token-grid size.
+
+    Grids no larger than the table use its top-left crop (ViTDet convention);
+    larger grids bilinearly interpolate it.
+
+    Args:
+        pos_embed (Tensor): position embedding table with [1, Hp, Wp, C].
+        hw (Tuple): target token grid (h, w).
+
+    Returns:
+        Position embedding with [1, h, w, C].
+    """
+    h, w = hw
+    if (h, w) == tuple(pos_embed.shape[1:3]):
+        return pos_embed
+    if h <= pos_embed.shape[1] and w <= pos_embed.shape[2]:
+        return pos_embed[:, :h, :w]
+    pe = pos_embed.permute(0, 3, 1, 2)
+    pe = F.interpolate(pe, size=(h, w), mode="bilinear", align_corners=False)
+    return pe.permute(0, 2, 3, 1)
+
+
 def get_rel_pos(q_size: int, k_size: int, rel_pos: torch.Tensor) -> torch.Tensor:
     """
     Get relative positional embeddings according to the relative positions of
@@ -421,3 +444,102 @@ class PatchEmbed(nn.Module):
         # B C H W -> B H W C
         x = x.permute(0, 2, 3, 1)
         return x
+
+
+def _packed_block_forward(
+    blk: Block,
+    x_flat: torch.Tensor,
+    sizes: List[Tuple[int, int]],
+    offsets: List[int],
+) -> torch.Tensor:
+    """One Block forward over a packed sequence of per-image token grids.
+
+    Same math as running each image's grid through ``blk`` alone. Token-wise ops
+    (norms, MLP, residuals) run on the packed [total, C] sequence in one call.
+    Windowed attention batches every image's (identical-size, zero-padded)
+    windows into a single ``blk.attn`` call — all windows share the same
+    window-size relative-position tables. Global attention runs one call per
+    distinct grid size, because the decomposed relative-position bias is
+    interpolated per (h, w).
+    """
+    shortcut = x_flat
+    x = blk.norm1(x_flat)
+
+    if blk.window_size > 0:
+        win_batches: List[torch.Tensor] = []
+        metas: List[Tuple[int, Tuple[int, int], Tuple[int, int]]] = []
+        for (h, w), offset in zip(sizes, offsets):
+            xi = x[offset : offset + h * w].view(1, h, w, -1)
+            wins, pad_hw = window_partition(xi, blk.window_size)
+            win_batches.append(wins)
+            metas.append((wins.shape[0], pad_hw, (h, w)))
+        wins_all = blk.attn(torch.cat(win_batches, dim=0))
+        parts: List[torch.Tensor] = []
+        woffset = 0
+        for nwin, pad_hw, hw in metas:
+            xi = window_unpartition(wins_all[woffset : woffset + nwin], blk.window_size, pad_hw, hw, 1)
+            parts.append(xi.reshape(-1, xi.shape[-1]))
+            woffset += nwin
+        x = torch.cat(parts, dim=0)
+    else:
+        groups: Dict[Tuple[int, int], List[int]] = {}
+        for i, hw in enumerate(sizes):
+            groups.setdefault(hw, []).append(i)
+        parts = [None] * len(sizes)  # type: ignore[list-item]
+        for (h, w), idxs in groups.items():
+            xi = torch.stack([x[offsets[i] : offsets[i] + h * w].view(h, w, -1) for i in idxs], dim=0)
+            xi = blk.attn(xi)
+            for j, i in enumerate(idxs):
+                parts[i] = xi[j].reshape(h * w, -1)
+        x = torch.cat(parts, dim=0)
+
+    x = shortcut + x
+    return x + blk.mlp(blk.norm2(x))
+
+
+def forward_trunk_packed(
+    patch_embed: nn.Module,
+    pos_embed: Optional[torch.Tensor],
+    blocks: nn.ModuleList,
+    images: List[torch.Tensor],
+) -> List[torch.Tensor]:
+    """Run the ViTDet trunk (patch_embed -> abs pos -> blocks, no neck) over a
+    list of variable-size images packed into one token sequence.
+
+    Function-preserving versus forwarding each image alone: every image gets its
+    own absolute-position crop/interpolation (``get_abs_pos``) and its own
+    relative-position bias in global-attention blocks, and windows never span
+    images. See ``_packed_block_forward`` for how attention is batched.
+
+    Args:
+        patch_embed (nn.Module): conv patch embedding, [B, 3, H, W] -> [B, h, w, C].
+        pos_embed (Tensor or None): absolute position table with [1, Hp, Wp, C].
+        blocks (nn.ModuleList): the trunk's ``Block`` list.
+        images (list): image tensors with [3, H_i, W_i] or [1, 3, H_i, W_i].
+
+    Returns:
+        One [h_i, w_i, C] feature map per image (pre-neck).
+    """
+    sizes: List[Tuple[int, int]] = []
+    flat_tokens: List[torch.Tensor] = []
+    for img in images:
+        if img.ndim == 3:
+            img = img.unsqueeze(0)
+        x = patch_embed(img)  # [1, h, w, C]
+        if pos_embed is not None:
+            x = x + get_abs_pos(pos_embed, (x.shape[1], x.shape[2]))
+        sizes.append((x.shape[1], x.shape[2]))
+        flat_tokens.append(x.reshape(-1, x.shape[-1]))
+
+    offsets = [0]
+    for h, w in sizes:
+        offsets.append(offsets[-1] + h * w)
+
+    x_flat = torch.cat(flat_tokens, dim=0)  # [total, C]
+    for blk in blocks:
+        x_flat = _packed_block_forward(blk, x_flat, sizes, offsets)
+
+    return [
+        x_flat[offset : offset + h * w].view(h, w, -1)
+        for (h, w), offset in zip(sizes, offsets)
+    ]
